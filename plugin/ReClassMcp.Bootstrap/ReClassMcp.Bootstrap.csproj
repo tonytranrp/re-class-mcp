@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>ReClassMcpBootstrap</AssemblyName>
+    <RootNamespace>ReClassMcpBootstrap</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
+    <Company>tonytranrp</Company>
+    <Product>ReClass.NET Plugin</Product>
+    <Description>Hot-reload bootstrap plugin for the ReClass MCP runtime.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ReClassMcp.Contracts\ReClassMcp.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="ReClass.NET">
+      <HintPath>$(ReClassNetInstallDir)\ReClass.NET.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

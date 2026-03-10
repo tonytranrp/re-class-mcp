@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.user
+*.suo
+*.tmp
+*.cache
+.DS_Store
+
+plugin/**/bin/
+plugin/**/obj/
+plugin/build/
+plugin/shadow/
+
+docs/generated/

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>ReClassMcp.Contracts</AssemblyName>
+    <RootNamespace>ReClassMcp.Contracts</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\$(Platform)\$(Configuration)\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="ReClass.NET">
+      <HintPath>$(ReClassNetInstallDir)\ReClass.NET.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

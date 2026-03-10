@@ -1,0 +1,50 @@
+{
+  "name": "re-class-mcp",
+  "version": "0.1.0",
+  "description": "FastMCP server and hot-swappable ReClass.NET bridge plugin.",
+  "type": "module",
+  "bin": {
+    "re-class-mcp": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "plugin",
+    "scripts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "npm run build:server",
+    "build:server": "tsc -p tsconfig.json",
+    "dev": "tsx server/src/cli.ts stdio",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "review": "npm run lint && npm run build:server",
+    "plugin:build": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64",
+    "plugin:build:x64": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64",
+    "plugin:build:x86": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x86"
+  },
+  "keywords": [
+    "mcp",
+    "reclass",
+    "fastmcp",
+    "reverse-engineering",
+    "codex"
+  ],
+  "author": "tonytranrp",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fastmcp": "3.34.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.5.2",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  }
+}
