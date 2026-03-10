@@ -1,6 +1,6 @@
 {
   "name": "re-class-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "FastMCP server and hot-swappable ReClass.NET bridge plugin.",
   "type": "module",
   "bin": {
@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "plugin",
+    "plugins",
     "scripts",
     "docs",
     "README.md",
@@ -22,6 +23,7 @@
     "dev": "tsx server/src/cli.ts stdio",
     "doctor": "node ./dist/cli.js doctor",
     "lint": "tsc --noEmit -p tsconfig.json",
+    "smoke": "node ./dist/cli.js smoke --auto-launch --platform x64",
     "review": "npm run lint && npm run build:server",
     "plugin:build": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64",
     "plugin:build:all": "npm run plugin:build:x64 && npm run plugin:build:x86",

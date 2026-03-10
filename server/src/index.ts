@@ -1,4 +1,6 @@
 import { FastMCP } from "fastmcp";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   type BridgeClientOptions,
@@ -18,16 +20,32 @@ import {
   type CodexInstallMode,
   installCodexServer,
 } from "./config/CodexConfig.js";
+import { dumpStructure, dumpStructures, type DumpFormat } from "./dump/StructureDumper.js";
+import { PluginManager } from "./plugins/PluginManager.js";
+import { runScriptFileInWorker, runScriptInWorker } from "./plugins/WorkerRunner.js";
 import {
   collectDoctorReport,
   ensureBridgeReady,
   type ReClassAutomationOptions,
   type ReClassPlatform,
 } from "./runtime/ReClassAutomation.js";
+import { clampConcurrency, mapWithConcurrency } from "./util/parallel.js";
 
-const SERVER_VERSION = "0.2.0" as const;
+const SERVER_VERSION = "0.3.0" as const;
 
-export interface ServerOptions extends BridgeClientOptions, ReClassAutomationOptions {}
+function defaultPluginDirectory(): string {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  if (currentDir.endsWith("\\dist") || currentDir.endsWith("/dist")) {
+    return resolve(currentDir, "../plugins");
+  }
+
+  return resolve(currentDir, "../../plugins");
+}
+
+export interface ServerOptions extends BridgeClientOptions, ReClassAutomationOptions {
+  pluginDir: string;
+  scriptTimeoutMs: number;
+}
 
 export interface ServeCliOptions extends ServerOptions {
   command: "serve";
@@ -45,6 +63,10 @@ interface LaunchCliOptions extends ServerOptions {
   command: "launch-reclass";
 }
 
+interface SmokeCliOptions extends ServerOptions {
+  command: "smoke";
+}
+
 interface InstallCodexCliOptions extends ServerOptions {
   command: "install-codex";
   configPath?: string | undefined;
@@ -58,6 +80,7 @@ type ParsedCliCommand =
   | ServeCliOptions
   | DoctorCliOptions
   | LaunchCliOptions
+  | SmokeCliOptions
   | InstallCodexCliOptions;
 
 function numberFromArg(value: string | undefined, fallback: number): number {
@@ -96,6 +119,15 @@ function defaultAutomationOptions(): ReClassAutomationOptions {
     launchTimeoutMs: 20_000,
     launchPollMs: 500,
     restartExisting: false,
+  };
+}
+
+function defaultServerOptions(): ServerOptions {
+  return {
+    ...defaultBridgeOptions(),
+    ...defaultAutomationOptions(),
+    pluginDir: defaultPluginDirectory(),
+    scriptTimeoutMs: 15_000,
   };
 }
 
@@ -144,6 +176,12 @@ function applyCommonArg(
     case "--attach-process-id":
       target.attachProcessId = numberFromArg(next, 0);
       return 1;
+    case "--plugin-dir":
+      target.pluginDir = stringFromArg(next, target.pluginDir);
+      return 1;
+    case "--script-timeout":
+      target.scriptTimeoutMs = numberFromArg(next, target.scriptTimeoutMs);
+      return 1;
     default:
       return -1;
   }
@@ -153,36 +191,15 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
   const values = [...argv];
   const first = values[0];
 
-  if (first === "doctor") {
-    const options: DoctorCliOptions = {
-      command: "doctor",
-      ...defaultBridgeOptions(),
-      ...defaultAutomationOptions(),
+  if (first === "doctor" || first === "launch-reclass" || first === "smoke") {
+    const options: DoctorCliOptions | LaunchCliOptions | SmokeCliOptions = {
+      command: first,
+      ...defaultServerOptions(),
     };
 
-    for (let index = 1; index < values.length; index += 1) {
-      const current = values[index];
-      if (current === undefined) {
-        break;
-      }
-
-      const consumed = applyCommonArg(options, current, values[index + 1]);
-      if (consumed < 0) {
-        throw new Error(`Unknown argument: ${current}`);
-      }
-      index += consumed;
+    if (first === "launch-reclass") {
+      options.autoLaunch = true;
     }
-
-    return options;
-  }
-
-  if (first === "launch-reclass") {
-    const options: LaunchCliOptions = {
-      command: "launch-reclass",
-      ...defaultBridgeOptions(),
-      ...defaultAutomationOptions(),
-      autoLaunch: true,
-    };
 
     for (let index = 1; index < values.length; index += 1) {
       const current = values[index];
@@ -203,8 +220,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
   if (first === "install-codex") {
     const options: InstallCodexCliOptions = {
       command: "install-codex",
-      ...defaultBridgeOptions(),
-      ...defaultAutomationOptions(),
+      ...defaultServerOptions(),
       installMode: "local",
       packageName: "re-class-mcp",
       startupTimeoutSec: 60,
@@ -269,8 +285,7 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
     httpHost: "127.0.0.1",
     httpPort: 38116,
     endpoint: "/mcp",
-    ...defaultBridgeOptions(),
-    ...defaultAutomationOptions(),
+    ...defaultServerOptions(),
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -312,13 +327,51 @@ export function parseCliArgs(argv: string[]): ParsedCliCommand {
   return options;
 }
 
+async function readMemoryMany(
+  bridge: ReClassBridgeClient,
+  requests: Array<{ address: string; size: number }>,
+  concurrency: number,
+): Promise<unknown[]> {
+  return await mapWithConcurrency(requests, clampConcurrency(concurrency, 4, 16), async (request) => {
+    return await bridge.assertSuccess("read_memory", {
+      address: request.address,
+      size: String(request.size),
+    });
+  });
+}
+
+async function followPointerChainsParallel(
+  bridge: ReClassBridgeClient,
+  requests: Array<{
+    base_address: string;
+    offsets: number[];
+    pointer_size?: 4 | 8 | undefined;
+    final_dereference?: boolean | undefined;
+  }>,
+  concurrency: number,
+): Promise<unknown[]> {
+  return await mapWithConcurrency(requests, clampConcurrency(concurrency, 4, 16), async (request) => {
+    return await followPointerChain(
+      bridge,
+      request.base_address,
+      request.offsets,
+      request.pointer_size ?? 8,
+      request.final_dereference ?? false,
+    );
+  });
+}
+
 function addToolSet(
   server: FastMCP,
   bridge: ReClassBridgeClient,
-  automation: ReClassAutomationOptions,
+  options: ServerOptions,
+  pluginManager: PluginManager,
+  scriptTimeoutMs: number,
 ): void {
   const noArgs = z.object({});
   const pointerSizeSchema = z.union([z.literal(4), z.literal(8)]);
+  const jsonArgsSchema = z.record(z.string(), z.unknown());
+  const dumpFormatSchema = z.enum(["json", "markdown", "cpp"]);
   const processSelector = z
     .object({
       process_id: z.number().int().positive().optional(),
@@ -370,14 +423,14 @@ function addToolSet(
     name: "doctor_reclass",
     description: "Report bridge reachability, resolved ReClass install path, and launch settings.",
     parameters: noArgs,
-    execute: async () => formatJson(await collectDoctorReport(bridge, automation)),
+    execute: async () => formatJson(await collectDoctorReport(bridge, options)),
   });
 
   server.addTool({
     name: "ensure_reclass_ready",
     description: "Ensure the bridge is online, launching ReClass if this MCP server was configured for auto-launch.",
     parameters: noArgs,
-    execute: async () => formatJson(await ensureBridgeReady(bridge, automation)),
+    execute: async () => formatJson(await ensureBridgeReady(bridge, options)),
   });
 
   server.addTool({
@@ -387,8 +440,90 @@ function addToolSet(
     execute: async () =>
       formatJson(
         await ensureBridgeReady(bridge, {
-          ...automation,
+          ...options,
           autoLaunch: true,
+        }),
+      ),
+  });
+
+  server.addTool({
+    name: "list_plugins",
+    description: "List hot-reloadable MCP plugin modules discovered from the plugin directory.",
+    parameters: noArgs,
+    execute: async () =>
+      formatJson({
+        plugin_directory: pluginManager.pluginDirectory,
+        plugins: pluginManager.listPlugins(),
+        errors: pluginManager.listErrors(),
+      }),
+  });
+
+  server.addTool({
+    name: "reload_plugins",
+    description: "Force a plugin directory rescan and return the loaded plugin manifest list.",
+    parameters: noArgs,
+    execute: async () => formatJson(await pluginManager.reload()),
+  });
+
+  server.addTool({
+    name: "plugin_run",
+    description: "Run one hot-reloaded plugin action in a worker thread.",
+    parameters: z.object({
+      plugin: z.string().min(1),
+      action: z.string().min(1),
+      args: jsonArgsSchema.optional(),
+      timeout_ms: z.number().int().positive().max(120_000).optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await pluginManager.runPlugin(
+          args.plugin,
+          args.action,
+          args.args ?? {},
+          options,
+          args.timeout_ms ?? scriptTimeoutMs,
+        ),
+      ),
+  });
+
+  server.addTool({
+    name: "script_eval",
+    description: "Evaluate a JavaScript chunk or expression in a worker thread with ReClass helper APIs exposed as api.",
+    parameters: z.object({
+      script: z.string().min(1),
+      expression: z.boolean().optional(),
+      args: jsonArgsSchema.optional(),
+      timeout_ms: z.number().int().positive().max(120_000).optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await runScriptInWorker({
+          bridgeOptions: options,
+          script: args.script,
+          expression: args.expression ?? false,
+          args: args.args,
+          timeoutMs: args.timeout_ms ?? scriptTimeoutMs,
+        }),
+      ),
+  });
+
+  server.addTool({
+    name: "script_run_file",
+    description: "Load a script file from disk and execute it in a worker thread with the ReClass helper API.",
+    parameters: z.object({
+      path: z.string().min(1),
+      expression: z.boolean().optional(),
+      args: jsonArgsSchema.optional(),
+      timeout_ms: z.number().int().positive().max(120_000).optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await runScriptFileInWorker({
+          bridgeOptions: options,
+          scriptPath: resolve(args.path),
+          expression: args.expression ?? false,
+          args: args.args,
+          timeoutMs: args.timeout_ms ?? scriptTimeoutMs,
         }),
       ),
   });
@@ -465,6 +600,22 @@ function addToolSet(
   });
 
   server.addTool({
+    name: "read_memory_many",
+    description: "Read multiple memory ranges in parallel with a bounded concurrency limit.",
+    parameters: z.object({
+      requests: z.array(
+        z.object({
+          address: z.string().min(1),
+          size: z.number().int().positive().max(0x10000),
+        }),
+      ),
+      concurrency: z.number().int().positive().max(16).optional(),
+    }),
+    execute: async (args) =>
+      formatJson(await readMemoryMany(bridge, args.requests, args.concurrency ?? 4)),
+  });
+
+  server.addTool({
     name: "read_pointer_value",
     description: "Read one pointer-sized value from the attached process.",
     parameters: z.object({
@@ -493,6 +644,26 @@ function addToolSet(
           args.pointer_size,
           args.final_dereference ?? false,
         ),
+      ),
+  });
+
+  server.addTool({
+    name: "follow_pointer_chains_parallel",
+    description: "Resolve several pointer chains in parallel with bounded concurrency.",
+    parameters: z.object({
+      requests: z.array(
+        z.object({
+          base_address: z.string().min(1),
+          offsets: z.array(z.number().int()),
+          pointer_size: pointerSizeSchema.optional(),
+          final_dereference: z.boolean().optional(),
+        }),
+      ),
+      concurrency: z.number().int().positive().max(16).optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await followPointerChainsParallel(bridge, args.requests, args.concurrency ?? 4),
       ),
   });
 
@@ -569,6 +740,53 @@ function addToolSet(
     description: "Get a class and return its node layout with computed end offsets.",
     parameters: classSelector,
     execute: async (args) => formatJson(await describeClassLayout(bridge, args.identifier)),
+  });
+
+  server.addTool({
+    name: "dump_structure",
+    description: "Dump one structure/class as JSON, Markdown, or C++ and optionally write it to disk.",
+    parameters: z.object({
+      identifier: z.string().min(1),
+      format: dumpFormatSchema.default("json"),
+      output_path: z.string().min(1).optional(),
+      include_content: z.boolean().optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await dumpStructure(bridge, args.identifier, {
+          format: args.format as DumpFormat,
+          outputPath: args.output_path,
+          includeContent: args.include_content,
+        }),
+      ),
+  });
+
+  server.addTool({
+    name: "dump_structures",
+    description: "Dump several structures in parallel by explicit identifier list or by class-name query.",
+    parameters: z
+      .object({
+        identifiers: z.array(z.string().min(1)).optional(),
+        query: z.string().min(1).optional(),
+        format: dumpFormatSchema.default("json"),
+        output_dir: z.string().min(1).optional(),
+        include_content: z.boolean().optional(),
+        concurrency: z.number().int().positive().max(16).optional(),
+      })
+      .refine((value) => (value.identifiers?.length ?? 0) > 0 || value.query !== undefined, {
+        message: "Provide identifiers or query.",
+      }),
+    execute: async (args) =>
+      formatJson(
+        await dumpStructures(bridge, {
+          identifiers: args.identifiers,
+          query: args.query,
+          format: args.format as DumpFormat,
+          outputDir: args.output_dir,
+          includeContent: args.include_content,
+          concurrency: args.concurrency,
+        }),
+      ),
   });
 
   server.addTool({
@@ -702,7 +920,7 @@ function addToolSet(
   });
 }
 
-function addResources(server: FastMCP, bridge: ReClassBridgeClient): void {
+function addResources(server: FastMCP, bridge: ReClassBridgeClient, pluginManager: PluginManager): void {
   server.addResource({
     uri: "reclass://status",
     name: "ReClass Runtime Status",
@@ -718,6 +936,19 @@ function addResources(server: FastMCP, bridge: ReClassBridgeClient): void {
     mimeType: "application/json",
     load: async () => ({
       text: formatJson(await bridge.assertSuccess("get_classes")),
+    }),
+  });
+
+  server.addResource({
+    uri: "reclass://plugins",
+    name: "ReClass MCP Plugins",
+    mimeType: "application/json",
+    load: async () => ({
+      text: formatJson({
+        plugin_directory: pluginManager.pluginDirectory,
+        plugins: pluginManager.listPlugins(),
+        errors: pluginManager.listErrors(),
+      }),
     }),
   });
 
@@ -738,7 +969,7 @@ function addResources(server: FastMCP, bridge: ReClassBridgeClient): void {
   });
 }
 
-export function createServer(options: ServerOptions): FastMCP {
+export function createServer(options: ServerOptions, pluginManager: PluginManager): FastMCP {
   const bridge = new ReClassBridgeClient(options);
 
   const server = new FastMCP({
@@ -746,18 +977,32 @@ export function createServer(options: ServerOptions): FastMCP {
     version: SERVER_VERSION,
     instructions:
       "Use this server to inspect and manipulate ReClass.NET state through the local bridge plugin. " +
-      "Process attachment, class layout editing, and raw memory reads all route through ReClass.NET.",
+      "It also supports hot-reloaded JS plugins, worker-thread script execution, and structure dump helpers.",
   });
 
-  addToolSet(server, bridge, options);
-  addResources(server, bridge);
+  addToolSet(server, bridge, options, pluginManager, options.scriptTimeoutMs);
+  addResources(server, bridge, pluginManager);
 
   return server;
 }
 
 async function runDoctor(options: DoctorCliOptions): Promise<void> {
   const bridge = new ReClassBridgeClient(options);
-  process.stdout.write(`${formatJson(await collectDoctorReport(bridge, options))}\n`);
+  const pluginManager = new PluginManager(options.pluginDir);
+  await pluginManager.start();
+
+  try {
+    process.stdout.write(
+      `${formatJson({
+        ...(await collectDoctorReport(bridge, options)),
+        plugin_directory: pluginManager.pluginDirectory,
+        plugins: pluginManager.listPlugins(),
+        plugin_errors: pluginManager.listErrors(),
+      })}\n`,
+    );
+  } finally {
+    await pluginManager.stop();
+  }
 }
 
 async function runLaunch(options: LaunchCliOptions): Promise<void> {
@@ -768,6 +1013,69 @@ async function runLaunch(options: LaunchCliOptions): Promise<void> {
 async function runInstallCodex(options: InstallCodexCliOptions): Promise<void> {
   const result = await installCodexServer(options);
   process.stdout.write(`${formatJson(result)}\n`);
+}
+
+async function runSmoke(options: SmokeCliOptions): Promise<void> {
+  const bridge = new ReClassBridgeClient(options);
+  const pluginManager = new PluginManager(options.pluginDir);
+  await pluginManager.start();
+  const tempClassName = `ReClassMcpSmoke_${Date.now()}`;
+
+  try {
+    const ready = await ensureBridgeReady(bridge, options);
+    const exampleScriptPath = resolve(options.pluginDir, "..", "scripts", "examples", "class-count.js");
+    const created = await createClassWithNodes(bridge, tempClassName, [
+      { type: "pointer", name: "ptr0" },
+      { type: "uint32", name: "value0", comment: "smoke" },
+    ]);
+    const appended = await appendNodes(bridge, tempClassName, [{ type: "uint64", name: "value1" }]);
+    const layout = await describeClassLayout(bridge, tempClassName);
+    const dumped = await dumpStructure(bridge, tempClassName, { format: "cpp", includeContent: true });
+    const scriptResult = await runScriptInWorker({
+      bridgeOptions: options,
+      script: "const classes = await api.listClasses(); return { count: classes.classes.length };",
+      expression: false,
+      timeoutMs: options.scriptTimeoutMs,
+    });
+    const scriptFileResult = await runScriptFileInWorker({
+      bridgeOptions: options,
+      scriptPath: exampleScriptPath,
+      expression: false,
+      args: { tempClassName },
+      timeoutMs: options.scriptTimeoutMs,
+    });
+    const plugins = pluginManager.listPlugins();
+    const pluginRunResult =
+      plugins.find((plugin) => plugin.name === "structure-tools") !== undefined
+        ? await pluginManager.runPlugin(
+            "structure-tools",
+            "dumpClass",
+            { identifier: tempClassName, format: "json" },
+            options,
+            options.scriptTimeoutMs,
+          )
+        : { skipped: true };
+
+    process.stdout.write(
+      `${formatJson({
+        ready,
+        created,
+        appended,
+        layout,
+        dumped_preview: dumped.content?.split("\n").slice(0, 8),
+        script_result: scriptResult,
+        script_file_result: scriptFileResult,
+        plugins,
+        plugin_run_result: pluginRunResult,
+      })}\n`,
+    );
+  } finally {
+    try {
+      await bridge.assertSuccess("delete_class", { id: tempClassName });
+    } catch {
+    }
+    await pluginManager.stop();
+  }
 }
 
 async function runServer(options: ServeCliOptions): Promise<void> {
@@ -781,9 +1089,12 @@ async function runServer(options: ServeCliOptions): Promise<void> {
     await ensureBridgeReady(bridge, options);
   }
 
-  const server = createServer(options);
+  const pluginManager = new PluginManager(options.pluginDir);
+  await pluginManager.start();
+  const server = createServer(options, pluginManager);
 
   const stop = async (): Promise<void> => {
+    await pluginManager.stop();
     await server.stop();
     process.exit(0);
   };
@@ -822,6 +1133,9 @@ export async function startFromCli(argv: string[]): Promise<void> {
       return;
     case "launch-reclass":
       await runLaunch(options);
+      return;
+    case "smoke":
+      await runSmoke(options);
       return;
     case "install-codex":
       await runInstallCodex(options);

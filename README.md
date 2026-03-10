@@ -9,6 +9,9 @@ It combines:
 - a byte-loaded runtime assembly that can be replaced without swapping the bootstrap DLL
 - Codex install helpers that replace the old Python MCP entry cleanly
 - optional ReClass auto-launch so the MCP server can bring the bridge online by itself
+- worker-thread script execution with `script_eval` and `script_run_file`
+- a hot-reloaded JS plugin system under `plugins/`
+- parallel structure dump and memory helper tooling
 
 ## What It Solves
 
@@ -25,7 +28,7 @@ This repo fixes that with:
 - a bootstrap/runtime split that survives runtime DLL replacement
 - `install-codex` support for replacing `[mcp_servers.reclass]`
 - launch/doctor commands for local validation
-- higher-level MCP tools such as `ensure_reclass_ready`, `follow_pointer_chain`, `create_class_with_nodes`, and `describe_class_layout`
+- higher-level MCP tools such as `ensure_reclass_ready`, `script_eval`, `plugin_run`, `dump_structure`, `read_memory_many`, and `describe_class_layout`
 
 ## Repo Layout
 
@@ -136,6 +139,30 @@ Replace Codex config entry:
 node .\dist\cli.js install-codex --mode github --github-repo tonytranrp/re-class-mcp --auto-launch
 ```
 
+Run the live smoke test:
+
+```powershell
+npm run smoke
+```
+
+## Plugin System
+
+Server-side plugins live in `plugins/` and hot-reload when files change. The bundled example is:
+
+- `plugins/structure-tools.mjs`
+
+Each plugin exports a default object with a `name` and `actions` map. Actions run in worker threads and receive:
+
+- `args`
+- `api.bridge(...)`
+- `api.listClasses()`
+- `api.describeClassLayout(...)`
+- `api.dumpStructure(...)`
+- `api.dumpStructures(...)`
+- `api.readMemoryMany(...)`
+
+That gives you a lightweight custom scripting layer without having to rebuild the MCP server for every helper you want to add.
+
 ## Plugin Deploy Flags
 
 `build-plugin.ps1` now supports:
@@ -178,11 +205,20 @@ Higher-level workflow tools:
 - `doctor_reclass`
 - `ensure_reclass_ready`
 - `launch_reclass`
+- `list_plugins`
+- `reload_plugins`
+- `plugin_run`
+- `script_eval`
+- `script_run_file`
 - `read_pointer_value`
 - `follow_pointer_chain`
+- `follow_pointer_chains_parallel`
+- `read_memory_many`
 - `read_c_string`
 - `find_classes`
 - `describe_class_layout`
+- `dump_structure`
+- `dump_structures`
 - `create_class_with_nodes`
 - `append_nodes`
 
@@ -203,4 +239,5 @@ So this is a practical hot-reload development loop, not true full unload/reload 
 
 - [Codex setup](./docs/CODEX_SETUP.md)
 - [Plugin deploy workflow](./docs/PLUGIN_DEPLOY.md)
+- [Plugin and scripting system](./docs/PLUGIN_SYSTEM.md)
 - [Minecraft 1.21.130 ClientInstance dump](./docs/MINECRAFT_1_21_130_CLIENTINSTANCE_DUMP.hpp)
