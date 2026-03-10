@@ -1,163 +1,206 @@
 # re-class-mcp
 
-`re-class-mcp` is a cleaned-up ReClass.NET MCP stack with:
+`re-class-mcp` is a rebuilt ReClass.NET MCP stack for Windows reverse-engineering workflows.
 
-- a FastMCP TypeScript server for Codex/Claude/Desktop MCP clients
-- a rebuilt ReClass.NET bridge plugin for `ReClass.NET 1.2.x`
-- hot-swappable runtime loading from a tiny bootstrap plugin
-- live process attach/list/detach support
-- stable loopback TCP bridge defaults on `127.0.0.1:27016`
+It combines:
 
-## What Changed
+- a FastMCP TypeScript server
+- a `ReClass.NET 1.2.x` bootstrap plugin that stays loadable by the legacy host
+- a byte-loaded runtime assembly that can be replaced without swapping the bootstrap DLL
+- Codex install helpers that replace the old Python MCP entry cleanly
+- optional ReClass auto-launch so the MCP server can bring the bridge online by itself
 
-The old one-piece plugin/server setup had three practical problems:
+## What It Solves
 
-1. it assumed a newer ReClass API surface than `ReClass.NET 1.2.0`
-2. it hardcoded `27015`, which often collides on Windows systems
-3. changing bridge code required replacing the loaded plugin DLL
+The older ReClass MCP flow was fragile in four ways:
 
-This repo fixes those by:
+1. it assumed a different ReClass plugin surface than `1.2.0`
+2. it collided with common `127.0.0.1:27015` usage on Windows
+3. it required manual MCP config surgery to replace the server
+4. it forced too much low-level bridge work for common tasks like pointer chasing or bulk class creation
 
-- pinning the bridge to `ReClass.NET 1.2.x` behavior
-- using a configurable bridge port with a sane default of `27016`
-- splitting the plugin into:
-  - `ReClassMcpBootstrap.dll`: the actual ReClass.NET plugin entrypoint
-  - `ReClassMcp.Runtime`: shadow-loaded and restartable while ReClass stays open
-- matching ReClass.NET's legacy `...Ext` plugin naming convention so the bootstrap is actually discovered by `1.2.0`
+This repo fixes that with:
 
-## Layout
+- default bridge binding on `127.0.0.1:27016`
+- a bootstrap/runtime split that survives runtime DLL replacement
+- `install-codex` support for replacing `[mcp_servers.reclass]`
+- launch/doctor commands for local validation
+- higher-level MCP tools such as `ensure_reclass_ready`, `follow_pointer_chain`, `create_class_with_nodes`, and `describe_class_layout`
+
+## Repo Layout
 
 - `server/`
-  FastMCP server and CLI
+  FastMCP server, CLI, launch automation, and Codex config installer
 - `plugin/ReClassMcp.Contracts`
-  Shared contracts between bootstrap and runtime
+  shared contracts between bootstrap and runtime
 - `plugin/ReClassMcp.Bootstrap`
-  ReClass.NET plugin entrypoint and hot-swap loader
+  the actual ReClass.NET plugin entrypoint
 - `plugin/ReClassMcp.Runtime`
-  TCP bridge and ReClass command dispatcher
+  hot-swappable runtime bridge and dispatcher
 - `scripts/build-plugin.ps1`
-  Builds plugin projects against an installed ReClass.NET copy
+  build, deploy, seed runtime config, and optionally start ReClass.NET
+- `docs/`
+  setup notes and live reverse-engineering dumps
 
-## Install
+## Quick Start
 
-### 1. Build the server
+### 1. Build the MCP server
 
 ```powershell
 npm install
 npm run build
 ```
 
-### 2. Build the plugin
+### 2. Build and deploy the plugin
 
-By default the build script targets `C:\Users\tonyi\Downloads\ReClass.NET`.
+Default install root is `C:\Users\tonyi\Downloads\ReClass.NET`.
+
+```powershell
+npm run plugin:install:x64
+```
+
+That deploy does four things:
+
+- builds the contracts, runtime, and bootstrap DLLs
+- copies them into `ReClass.NET\x64\Plugins`
+- writes `ReClassMcp.runtime.json`
+- starts `ReClass.NET.exe` so the bridge comes up immediately
+
+For a build-only deploy:
 
 ```powershell
 npm run plugin:build:x64
 ```
 
-The installer also disables the legacy `ReClassMCP.dll` plugin artifacts in the target `Plugins` folder so the old bridge does not double-load beside the new bootstrap after a ReClass restart.
-
-Or override the install root:
+For both architectures:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-plugin.ps1 -Configuration Release -Platform x64 -ReClassInstallRoot "D:\Tools\ReClass.NET"
+npm run plugin:build:all
 ```
 
-### 3. Start the MCP server
+### 3. Replace the old Codex MCP entry
+
+Local repo install:
 
 ```powershell
-npx tsx .\server\src\cli.ts stdio
+npm run codex:install:local
 ```
 
-After `npm run build`, the committed CLI entry is:
+GitHub-backed install:
 
 ```powershell
-node .\dist\cli.js stdio
+npm run codex:install:github
 ```
 
-## Codex MCP Add
-
-Local example:
+Manual command form:
 
 ```powershell
-codex mcp add reclass -- node C:\Users\tonyi\OneDrive\Documents\GitHub\re-class-mcp\dist\cli.js stdio --host 127.0.0.1 --port 27016
+node .\dist\cli.js install-codex --mode local --auto-launch --platform x64
 ```
 
-Public-repo-ready pattern once the repo is published:
+That rewrites the `[mcp_servers.reclass]` block in `~/.codex/config.toml` and replaces the legacy Python server entry.
+
+### 4. Restart Codex
+
+Codex needs a fresh session to pick up a changed MCP config. This repo updates the config for you, but the running Codex process still has to be restarted outside the current MCP session.
+
+## CLI Commands
+
+Serve over stdio:
 
 ```powershell
-codex mcp add reclass -- npx -y github:YOUR_GITHUB_USER/re-class-mcp stdio --host 127.0.0.1 --port 27016
+node .\dist\cli.js stdio --auto-launch --platform x64
 ```
 
-If you later publish to npm, the command becomes:
+Serve over HTTP stream:
 
 ```powershell
-codex mcp add reclass -- npx -y re-class-mcp stdio --host 127.0.0.1 --port 27016
+node .\dist\cli.js http --http-port 38116 --auto-launch
 ```
 
-## Plugin Runtime Config
+Check install and bridge state:
 
-The plugin writes `Plugins\ReClassMcp.runtime.json` on first start:
-
-```json
-{
-  "bindAddress": "127.0.0.1",
-  "port": 27016,
-  "autoStartBridge": true,
-  "writeEnabled": true
-}
+```powershell
+node .\dist\cli.js doctor --platform x64
 ```
 
-Editing this file reloads the bridge listener without restarting ReClass.NET.
+Launch ReClass and wait for the bridge:
+
+```powershell
+node .\dist\cli.js launch-reclass --platform x64
+```
+
+Replace Codex config entry:
+
+```powershell
+node .\dist\cli.js install-codex --mode github --github-repo tonytranrp/re-class-mcp --auto-launch
+```
+
+## Plugin Deploy Flags
+
+`build-plugin.ps1` now supports:
+
+- `-StartReClass`
+- `-RestartReClass`
+- `-BindAddress`
+- `-BridgePort`
+- `-AutoStartBridge`
+- `-WriteEnabled`
+- `-WaitForBridgeMs`
+
+Example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-plugin.ps1 `
+  -Platform x64 `
+  -StartReClass:$true `
+  -RestartReClass:$true `
+  -BridgePort 27016 `
+  -WaitForBridgeMs 20000
+```
+
+## MCP Tools
+
+Low-level bridge tools:
+
+- `read_memory`
+- `write_memory`
+- `attach_process`
+- `get_modules`
+- `get_sections`
+- `get_classes`
+- `get_class`
+- `add_node`
+- `change_node_type`
+
+Higher-level workflow tools:
+
+- `doctor_reclass`
+- `ensure_reclass_ready`
+- `launch_reclass`
+- `read_pointer_value`
+- `follow_pointer_chain`
+- `read_c_string`
+- `find_classes`
+- `describe_class_layout`
+- `create_class_with_nodes`
+- `append_nodes`
 
 ## Hot Reload Model
 
-The runtime DLL is byte-loaded by the bootstrap plugin instead of being held open as the active plugin assembly.
+The bootstrap plugin is the only assembly ReClass.NET loads as a plugin entrypoint. The runtime DLL is read into memory as bytes and instantiated from there.
 
 That means:
 
-- config changes reload immediately
-- runtime DLL changes can be picked up without replacing the bootstrap plugin DLL
-- old runtime assemblies remain loaded for the current ReClass session, so repeated development reloads trade memory for convenience
+- runtime config edits hot-reload
+- runtime DLL replacements hot-reload
+- bootstrap DLL changes still require a ReClass restart
+- already-loaded runtime assemblies are not unloaded from the default AppDomain
 
-That tradeoff is deliberate. It keeps the development loop fast without pretending the .NET Framework plugin host can truly unload a loaded assembly from the default AppDomain.
+So this is a practical hot-reload development loop, not true full unload/reload of every managed assembly.
 
-## Exposed MCP Surface
+## Additional Docs
 
-Core tools:
-
-- `is_connected`
-- `get_status`
-- `get_runtime_status`
-- `get_process_info`
-- `list_processes`
-- `attach_process`
-- `detach_process`
-- `read_memory`
-- `write_memory`
-- `get_modules`
-- `get_sections`
-- `parse_address`
-- `get_classes`
-- `get_class`
-- `get_nodes`
-- `create_class`
-- `delete_class`
-- `rename_class`
-- `set_class_address`
-- `set_class_comment`
-- `add_node`
-- `rename_node`
-- `set_comment`
-- `change_node_type`
-- `list_node_types`
-- `restart_bridge`
-
-## Status
-
-This repo was seeded from a live-tested recovery on:
-
-- `ReClass.NET 1.2.0.0`
-- `Minecraft.Windows.exe 1.21.130`
-
-The `ClientInstance` reverse-engineering notes for that build can be carried into `docs/` as the next pass.
+- [Codex setup](./docs/CODEX_SETUP.md)
+- [Plugin deploy workflow](./docs/PLUGIN_DEPLOY.md)
+- [Minecraft 1.21.130 ClientInstance dump](./docs/MINECRAFT_1_21_130_CLIENTINSTANCE_DUMP.hpp)

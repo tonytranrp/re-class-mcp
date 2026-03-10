@@ -62,6 +62,8 @@ namespace ReClassMcp.Runtime
                         return GetNodes(args);
                     case "create_class":
                         return CreateClass(args);
+                    case "create_class_with_nodes":
+                        return CreateClassWithNodes(args);
                     case "delete_class":
                         return DeleteClass(args);
                     case "rename_class":
@@ -72,6 +74,8 @@ namespace ReClassMcp.Runtime
                         return SetClassComment(args);
                     case "add_node":
                         return AddNode(args);
+                    case "append_nodes":
+                        return AppendNodes(args);
                     case "rename_node":
                         return RenameNode(args);
                     case "set_comment":
@@ -316,6 +320,41 @@ namespace ReClassMcp.Runtime
                 : Success(new JObject { ["class"] = SerializeClass(classNode, true) });
         }
 
+        private JObject CreateClassWithNodes(JObject args)
+        {
+            var name = RequireString(args, "name");
+            var address = args["address"]?.ToString();
+            var comment = args["comment"]?.ToString() ?? string.Empty;
+            var nodeSpecs = RequireNodeSpecs(args);
+
+            ClassNode classNode = null;
+            InvokeOnMainThread(() =>
+            {
+                classNode = ClassNode.Create();
+                classNode.Name = name;
+                if (!string.IsNullOrWhiteSpace(address))
+                {
+                    classNode.AddressFormula = address;
+                }
+
+                if (!string.IsNullOrWhiteSpace(comment))
+                {
+                    classNode.Comment = comment;
+                }
+
+                foreach (var nodeSpec in nodeSpecs)
+                {
+                    classNode.AddNode(CreateNodeFromSpec(nodeSpec));
+                }
+
+                host.MainWindow.Invalidate();
+            });
+
+            return classNode == null
+                ? Error("Failed to create class.")
+                : Success(new JObject { ["class"] = SerializeClass(classNode, true) });
+        }
+
         private JObject DeleteClass(JObject args)
         {
             var project = GetCurrentProject();
@@ -425,6 +464,24 @@ namespace ReClassMcp.Runtime
             return created == null
                 ? Error("Failed to add node.")
                 : Success(new JObject { ["node"] = SerializeNode(created, classNode.FindNodeIndex(created)) });
+        }
+
+        private JObject AppendNodes(JObject args)
+        {
+            var classNode = RequireClassFromArgs(args);
+            var nodeSpecs = RequireNodeSpecs(args);
+
+            InvokeOnMainThread(() =>
+            {
+                foreach (var nodeSpec in nodeSpecs)
+                {
+                    classNode.AddNode(CreateNodeFromSpec(nodeSpec));
+                }
+
+                host.MainWindow.Invalidate();
+            });
+
+            return Success(new JObject { ["class"] = SerializeClass(classNode, true) });
         }
 
         private JObject RenameNode(JObject args)
@@ -591,6 +648,42 @@ namespace ReClassMcp.Runtime
             }
 
             return classNode.Nodes[index];
+        }
+
+        private IReadOnlyList<JObject> RequireNodeSpecs(JObject args)
+        {
+            var nodeArray = args["nodes"] as JArray;
+            if (nodeArray == null)
+            {
+                throw new InvalidOperationException("Missing 'nodes' parameter.");
+            }
+
+            return nodeArray.OfType<JObject>().ToArray();
+        }
+
+        private BaseNode CreateNodeFromSpec(JObject nodeSpec)
+        {
+            var nodeType = NodeTypeRegistry.Resolve(RequireString(nodeSpec, "type"));
+            if (nodeType == null)
+            {
+                throw new InvalidOperationException($"Unknown node type: {nodeSpec["type"]}");
+            }
+
+            var node = BaseNode.CreateInstanceFromType(nodeType);
+            var nodeName = nodeSpec["name"]?.ToString();
+            var nodeComment = nodeSpec["comment"]?.ToString();
+
+            if (!string.IsNullOrWhiteSpace(nodeName))
+            {
+                node.Name = nodeName;
+            }
+
+            if (!string.IsNullOrWhiteSpace(nodeComment))
+            {
+                node.Comment = nodeComment;
+            }
+
+            return node;
         }
 
         private ClassNode FindClass(ReClassNetProject project, string identifier)

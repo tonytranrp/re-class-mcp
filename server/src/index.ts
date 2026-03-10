@@ -5,17 +5,60 @@ import {
   ReClassBridgeClient,
   formatJson,
 } from "./bridge/ReClassBridgeClient.js";
+import {
+  appendNodes,
+  createClassWithNodes,
+  describeClassLayout,
+  findClasses,
+  followPointerChain,
+  readCString,
+  readPointerValue,
+} from "./bridge/ReClassHelpers.js";
+import {
+  type CodexInstallMode,
+  installCodexServer,
+} from "./config/CodexConfig.js";
+import {
+  collectDoctorReport,
+  ensureBridgeReady,
+  type ReClassAutomationOptions,
+  type ReClassPlatform,
+} from "./runtime/ReClassAutomation.js";
 
-const SERVER_VERSION = "0.1.0" as const;
+const SERVER_VERSION = "0.2.0" as const;
 
-export interface ServerOptions extends BridgeClientOptions {}
+export interface ServerOptions extends BridgeClientOptions, ReClassAutomationOptions {}
 
-export interface CliOptions extends ServerOptions {
+export interface ServeCliOptions extends ServerOptions {
+  command: "serve";
   mode: "stdio" | "httpStream";
   httpHost: string;
   httpPort: number;
   endpoint: `/${string}`;
 }
+
+interface DoctorCliOptions extends ServerOptions {
+  command: "doctor";
+}
+
+interface LaunchCliOptions extends ServerOptions {
+  command: "launch-reclass";
+}
+
+interface InstallCodexCliOptions extends ServerOptions {
+  command: "install-codex";
+  configPath?: string | undefined;
+  installMode: CodexInstallMode;
+  githubRepo?: string | undefined;
+  packageName?: string | undefined;
+  startupTimeoutSec: number;
+}
+
+type ParsedCliCommand =
+  | ServeCliOptions
+  | DoctorCliOptions
+  | LaunchCliOptions
+  | InstallCodexCliOptions;
 
 function numberFromArg(value: string | undefined, fallback: number): number {
   if (!value) {
@@ -34,38 +77,215 @@ function stringFromArg(value: string | undefined, fallback: string): string {
   return value && value.length > 0 ? value : fallback;
 }
 
-export function parseCliArgs(argv: string[]): CliOptions {
-  const values = [...argv];
-  const modeToken = values[0] === "http" ? "httpStream" : values[0] === "stdio" ? "stdio" : "stdio";
-  const args = values[0] === "http" || values[0] === "stdio" ? values.slice(1) : values;
+function isServeCommandToken(value: string | undefined): boolean {
+  return value === undefined || value === "stdio" || value === "http" || value.startsWith("--");
+}
 
-  const options: CliOptions = {
-    mode: modeToken,
+function defaultBridgeOptions(): BridgeClientOptions {
+  return {
     host: "127.0.0.1",
     port: 27016,
     timeoutMs: 10_000,
+  };
+}
+
+function defaultAutomationOptions(): ReClassAutomationOptions {
+  return {
+    autoLaunch: false,
+    platform: "x64",
+    launchTimeoutMs: 20_000,
+    launchPollMs: 500,
+    restartExisting: false,
+  };
+}
+
+function applyCommonArg(
+  target: ServerOptions,
+  current: string,
+  next: string | undefined,
+): number {
+  switch (current) {
+    case "--host":
+      target.host = stringFromArg(next, target.host);
+      return 1;
+    case "--port":
+      target.port = numberFromArg(next, target.port);
+      return 1;
+    case "--timeout":
+      target.timeoutMs = numberFromArg(next, target.timeoutMs);
+      return 1;
+    case "--auto-launch":
+      target.autoLaunch = true;
+      return 0;
+    case "--reclass-root":
+      target.reClassInstallRoot = stringFromArg(next, target.reClassInstallRoot ?? "");
+      return 1;
+    case "--platform": {
+      const platform = stringFromArg(next, target.platform);
+      if (platform !== "x64" && platform !== "x86") {
+        throw new Error(`Unsupported platform: ${platform}`);
+      }
+
+      target.platform = platform;
+      return 1;
+    }
+    case "--launch-timeout":
+      target.launchTimeoutMs = numberFromArg(next, target.launchTimeoutMs);
+      return 1;
+    case "--launch-poll":
+      target.launchPollMs = numberFromArg(next, target.launchPollMs);
+      return 1;
+    case "--restart-reclass":
+      target.restartExisting = true;
+      return 0;
+    case "--attach-process":
+      target.attachProcessName = stringFromArg(next, "");
+      return 1;
+    case "--attach-process-id":
+      target.attachProcessId = numberFromArg(next, 0);
+      return 1;
+    default:
+      return -1;
+  }
+}
+
+export function parseCliArgs(argv: string[]): ParsedCliCommand {
+  const values = [...argv];
+  const first = values[0];
+
+  if (first === "doctor") {
+    const options: DoctorCliOptions = {
+      command: "doctor",
+      ...defaultBridgeOptions(),
+      ...defaultAutomationOptions(),
+    };
+
+    for (let index = 1; index < values.length; index += 1) {
+      const current = values[index];
+      if (current === undefined) {
+        break;
+      }
+
+      const consumed = applyCommonArg(options, current, values[index + 1]);
+      if (consumed < 0) {
+        throw new Error(`Unknown argument: ${current}`);
+      }
+      index += consumed;
+    }
+
+    return options;
+  }
+
+  if (first === "launch-reclass") {
+    const options: LaunchCliOptions = {
+      command: "launch-reclass",
+      ...defaultBridgeOptions(),
+      ...defaultAutomationOptions(),
+      autoLaunch: true,
+    };
+
+    for (let index = 1; index < values.length; index += 1) {
+      const current = values[index];
+      if (current === undefined) {
+        break;
+      }
+
+      const consumed = applyCommonArg(options, current, values[index + 1]);
+      if (consumed < 0) {
+        throw new Error(`Unknown argument: ${current}`);
+      }
+      index += consumed;
+    }
+
+    return options;
+  }
+
+  if (first === "install-codex") {
+    const options: InstallCodexCliOptions = {
+      command: "install-codex",
+      ...defaultBridgeOptions(),
+      ...defaultAutomationOptions(),
+      installMode: "local",
+      packageName: "re-class-mcp",
+      startupTimeoutSec: 60,
+    };
+
+    for (let index = 1; index < values.length; index += 1) {
+      const current = values[index];
+      if (current === undefined) {
+        break;
+      }
+      const next = values[index + 1];
+      const consumed = applyCommonArg(options, current, next);
+      if (consumed >= 0) {
+        index += consumed;
+        continue;
+      }
+
+      switch (current) {
+        case "--config":
+          options.configPath = stringFromArg(next, "");
+          index += 1;
+          break;
+        case "--mode": {
+          const mode = stringFromArg(next, options.installMode);
+          if (mode !== "local" && mode !== "github" && mode !== "npm") {
+            throw new Error(`Unsupported install mode: ${mode}`);
+          }
+
+          options.installMode = mode;
+          index += 1;
+          break;
+        }
+        case "--github-repo":
+          options.githubRepo = stringFromArg(next, "");
+          index += 1;
+          break;
+        case "--package-name":
+          options.packageName = stringFromArg(next, options.packageName ?? "re-class-mcp");
+          index += 1;
+          break;
+        case "--startup-timeout":
+          options.startupTimeoutSec = numberFromArg(next, options.startupTimeoutSec);
+          index += 1;
+          break;
+        default:
+          throw new Error(`Unknown argument: ${current}`);
+      }
+    }
+
+    return options;
+  }
+
+  if (!isServeCommandToken(first)) {
+    throw new Error(`Unknown command: ${first}`);
+  }
+
+  const modeToken = first === "http" ? "httpStream" : "stdio";
+  const args = first === "http" || first === "stdio" ? values.slice(1) : values;
+  const options: ServeCliOptions = {
+    command: "serve",
+    mode: modeToken,
     httpHost: "127.0.0.1",
     httpPort: 38116,
     endpoint: "/mcp",
+    ...defaultBridgeOptions(),
+    ...defaultAutomationOptions(),
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const current = args[index];
+    if (current === undefined) {
+      break;
+    }
     const next = args[index + 1];
+    const consumed = applyCommonArg(options, current, next);
+    if (consumed >= 0) {
+      index += consumed;
+      continue;
+    }
 
     switch (current) {
-      case "--host":
-        options.host = stringFromArg(next, options.host);
-        index += 1;
-        break;
-      case "--port":
-        options.port = numberFromArg(next, options.port);
-        index += 1;
-        break;
-      case "--timeout":
-        options.timeoutMs = numberFromArg(next, options.timeoutMs);
-        index += 1;
-        break;
       case "--http-host":
         options.httpHost = stringFromArg(next, options.httpHost);
         index += 1;
@@ -92,8 +312,13 @@ export function parseCliArgs(argv: string[]): CliOptions {
   return options;
 }
 
-function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
+function addToolSet(
+  server: FastMCP,
+  bridge: ReClassBridgeClient,
+  automation: ReClassAutomationOptions,
+): void {
   const noArgs = z.object({});
+  const pointerSizeSchema = z.union([z.literal(4), z.literal(8)]);
   const processSelector = z
     .object({
       process_id: z.number().int().positive().optional(),
@@ -103,20 +328,17 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
       message: "Provide process_id or process_name.",
     });
 
-  const classSelector = z
-    .object({
-      identifier: z.string().min(1),
-    });
+  const classSelector = z.object({
+    identifier: z.string().min(1),
+  });
 
-  const classIdSelector = z
-    .object({
-      class_id: z.string().min(1),
-    });
+  const classIdSelector = z.object({
+    class_id: z.string().min(1),
+  });
 
-  const classNameSelector = z
-    .object({
-      class_name: z.string().min(1),
-    });
+  const classNameSelector = z.object({
+    class_name: z.string().min(1),
+  });
 
   const classRefSchema = z.union([classIdSelector, classNameSelector]);
 
@@ -125,6 +347,12 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
       node_index: z.number().int().nonnegative(),
     }),
   );
+
+  const nodeSpecSchema = z.object({
+    type: z.string().min(1),
+    name: z.string().min(1).optional(),
+    comment: z.string().optional(),
+  });
 
   const run = async (
     command: string,
@@ -136,6 +364,33 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
     description: "Check whether the ReClass bridge plugin is reachable.",
     parameters: noArgs,
     execute: async () => await run("ping"),
+  });
+
+  server.addTool({
+    name: "doctor_reclass",
+    description: "Report bridge reachability, resolved ReClass install path, and launch settings.",
+    parameters: noArgs,
+    execute: async () => formatJson(await collectDoctorReport(bridge, automation)),
+  });
+
+  server.addTool({
+    name: "ensure_reclass_ready",
+    description: "Ensure the bridge is online, launching ReClass if this MCP server was configured for auto-launch.",
+    parameters: noArgs,
+    execute: async () => formatJson(await ensureBridgeReady(bridge, automation)),
+  });
+
+  server.addTool({
+    name: "launch_reclass",
+    description: "Launch ReClass.NET and wait for the bridge to come online.",
+    parameters: noArgs,
+    execute: async () =>
+      formatJson(
+        await ensureBridgeReady(bridge, {
+          ...automation,
+          autoLaunch: true,
+        }),
+      ),
   });
 
   server.addTool({
@@ -210,6 +465,50 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
   });
 
   server.addTool({
+    name: "read_pointer_value",
+    description: "Read one pointer-sized value from the attached process.",
+    parameters: z.object({
+      address: z.string().min(1),
+      pointer_size: pointerSizeSchema.default(8),
+    }),
+    execute: async (args) =>
+      formatJson(await readPointerValue(bridge, args.address, args.pointer_size)),
+  });
+
+  server.addTool({
+    name: "follow_pointer_chain",
+    description: "Resolve a multilevel pointer chain by repeatedly dereferencing and applying offsets.",
+    parameters: z.object({
+      base_address: z.string().min(1),
+      offsets: z.array(z.number().int()),
+      pointer_size: pointerSizeSchema.default(8),
+      final_dereference: z.boolean().optional(),
+    }),
+    execute: async (args) =>
+      formatJson(
+        await followPointerChain(
+          bridge,
+          args.base_address,
+          args.offsets,
+          args.pointer_size,
+          args.final_dereference ?? false,
+        ),
+      ),
+  });
+
+  server.addTool({
+    name: "read_c_string",
+    description: "Read a null-terminated UTF-8 or UTF-16LE string from the attached process.",
+    parameters: z.object({
+      address: z.string().min(1),
+      max_length: z.number().int().positive().max(0x4000),
+      encoding: z.enum(["utf8", "utf16le"]).default("utf8"),
+    }),
+    execute: async (args) =>
+      formatJson(await readCString(bridge, args.address, args.max_length, args.encoding)),
+  });
+
+  server.addTool({
     name: "write_memory",
     description: "Write raw hex bytes into the attached process.",
     parameters: z.object({
@@ -250,10 +549,26 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
   });
 
   server.addTool({
+    name: "find_classes",
+    description: "Filter active ReClass classes by substring match on name or id.",
+    parameters: z.object({
+      query: z.string().min(1),
+    }),
+    execute: async (args) => formatJson(await findClasses(bridge, args.query)),
+  });
+
+  server.addTool({
     name: "get_class",
     description: "Get a class by id or name.",
     parameters: classSelector,
     execute: async (args) => await run("get_class", { id: args.identifier }),
+  });
+
+  server.addTool({
+    name: "describe_class_layout",
+    description: "Get a class and return its node layout with computed end offsets.",
+    parameters: classSelector,
+    execute: async (args) => formatJson(await describeClassLayout(bridge, args.identifier)),
   });
 
   server.addTool({
@@ -271,6 +586,19 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
       address: z.string().min(1).optional(),
     }),
     execute: async (args) => await run("create_class", args.address ? args : { name: args.name }),
+  });
+
+  server.addTool({
+    name: "create_class_with_nodes",
+    description: "Create a class and append an initial node list in one call.",
+    parameters: z.object({
+      name: z.string().min(1),
+      address: z.string().min(1).optional(),
+      comment: z.string().optional(),
+      nodes: z.array(nodeSpecSchema),
+    }),
+    execute: async (args) =>
+      formatJson(await createClassWithNodes(bridge, args.name, args.nodes, args.address, args.comment)),
   });
 
   server.addTool({
@@ -320,6 +648,17 @@ function addToolSet(server: FastMCP, bridge: ReClassBridgeClient): void {
       }),
     ),
     execute: async (args) => await run("add_node", args),
+  });
+
+  server.addTool({
+    name: "append_nodes",
+    description: "Append multiple nodes to an existing class in one call.",
+    parameters: classSelector.and(
+      z.object({
+        nodes: z.array(nodeSpecSchema),
+      }),
+    ),
+    execute: async (args) => formatJson(await appendNodes(bridge, args.identifier, args.nodes)),
   });
 
   server.addTool({
@@ -410,14 +749,38 @@ export function createServer(options: ServerOptions): FastMCP {
       "Process attachment, class layout editing, and raw memory reads all route through ReClass.NET.",
   });
 
-  addToolSet(server, bridge);
+  addToolSet(server, bridge, options);
   addResources(server, bridge);
 
   return server;
 }
 
-export async function startFromCli(argv: string[]): Promise<void> {
-  const options = parseCliArgs(argv);
+async function runDoctor(options: DoctorCliOptions): Promise<void> {
+  const bridge = new ReClassBridgeClient(options);
+  process.stdout.write(`${formatJson(await collectDoctorReport(bridge, options))}\n`);
+}
+
+async function runLaunch(options: LaunchCliOptions): Promise<void> {
+  const bridge = new ReClassBridgeClient(options);
+  process.stdout.write(`${formatJson(await ensureBridgeReady(bridge, options))}\n`);
+}
+
+async function runInstallCodex(options: InstallCodexCliOptions): Promise<void> {
+  const result = await installCodexServer(options);
+  process.stdout.write(`${formatJson(result)}\n`);
+}
+
+async function runServer(options: ServeCliOptions): Promise<void> {
+  if (
+    options.autoLaunch ||
+    options.restartExisting ||
+    options.attachProcessId !== undefined ||
+    options.attachProcessName !== undefined
+  ) {
+    const bridge = new ReClassBridgeClient(options);
+    await ensureBridgeReady(bridge, options);
+  }
+
   const server = createServer(options);
 
   const stop = async (): Promise<void> => {
@@ -449,3 +812,26 @@ export async function startFromCli(argv: string[]): Promise<void> {
     transportType: "stdio",
   });
 }
+
+export async function startFromCli(argv: string[]): Promise<void> {
+  const options = parseCliArgs(argv);
+
+  switch (options.command) {
+    case "doctor":
+      await runDoctor(options);
+      return;
+    case "launch-reclass":
+      await runLaunch(options);
+      return;
+    case "install-codex":
+      await runInstallCodex(options);
+      return;
+    case "serve":
+      await runServer(options);
+      return;
+    default:
+      throw new Error(`Unhandled command: ${(options as { command: string }).command}`);
+  }
+}
+
+export type { ReClassPlatform };

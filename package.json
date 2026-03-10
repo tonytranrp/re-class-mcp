@@ -1,6 +1,6 @@
 {
   "name": "re-class-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FastMCP server and hot-swappable ReClass.NET bridge plugin.",
   "type": "module",
   "bin": {
@@ -20,11 +20,17 @@
     "build": "npm run build:server",
     "build:server": "tsc -p tsconfig.json",
     "dev": "tsx server/src/cli.ts stdio",
+    "doctor": "node ./dist/cli.js doctor",
     "lint": "tsc --noEmit -p tsconfig.json",
     "review": "npm run lint && npm run build:server",
     "plugin:build": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64",
+    "plugin:build:all": "npm run plugin:build:x64 && npm run plugin:build:x86",
     "plugin:build:x64": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64",
-    "plugin:build:x86": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x86"
+    "plugin:build:x86": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x86",
+    "plugin:install:x64": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x64 -StartReClass:$true",
+    "plugin:install:x86": "powershell -ExecutionPolicy Bypass -File ./scripts/build-plugin.ps1 -Configuration Release -Platform x86 -StartReClass:$true",
+    "codex:install:local": "node ./dist/cli.js install-codex --mode local --auto-launch --platform x64",
+    "codex:install:github": "node ./dist/cli.js install-codex --mode github --github-repo tonytranrp/re-class-mcp --auto-launch --platform x64"
   },
   "keywords": [
     "mcp",
